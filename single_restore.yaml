@@ -1,0 +1,15 @@
+-
+    # 假设你把这张噪点图放到了这个路径
+    input_img:  Data/Noisy_Images/bear_grass.png
+    #input_img:  Data/Masked_Images/bear_grass.png
+    source_prompt: >
+      A noised picture.
+    
+
+    target_prompts:
+    - >
+      A denoised picture.
+      
+
+    target_codes:  #没用
+    - brown bear

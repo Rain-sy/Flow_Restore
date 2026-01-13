@@ -25,7 +25,7 @@ if __name__ == "__main__":
 
     # load exp yaml file to dict
     exp_yaml = args.exp_yaml
-    with open(exp_yaml) as file:
+    with open(exp_yaml, encoding='utf-8') as file:
         exp_configs = yaml.load(file, Loader=yaml.FullLoader)
 
     device = torch.device(f"cuda:{device_number}" if torch.cuda.is_available() else "cpu")
@@ -38,9 +38,10 @@ if __name__ == "__main__":
         pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float16)
     else:
         raise NotImplementedError(f"Model type {model_type} not implemented")
-    
+              
     scheduler = pipe.scheduler
-    pipe = pipe.to(device)
+    # pipe = pipe.to(device)
+    pipe.enable_model_cpu_offload()   #优化速度
 
     for exp_dict in exp_configs:
 
@@ -60,7 +61,7 @@ if __name__ == "__main__":
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         dataset_yaml = exp_dict["dataset_yaml"]
-        with open(dataset_yaml) as file:
+        with open(dataset_yaml, encoding='utf-8') as file:
             dataset_configs = yaml.load(file, Loader=yaml.FullLoader)
 
         # check dataset_configs 
@@ -75,7 +76,7 @@ if __name__ == "__main__":
             image_src_path = data_dict["input_img"]
 
             # load image
-            image = Image.open(image_src_path)
+            image = Image.open(image_src_path).convert("RGB")
             # crop image to have both dimensions divisibe by 16 - avoids issues with resizing
             image = image.crop((0, 0, image.width - image.width % 16, image.height - image.height % 16))
             image_src = pipe.image_processor.preprocess(image)
@@ -132,15 +133,13 @@ if __name__ == "__main__":
                 # make sure to create the directories before saving
                 save_dir = f"outputs/{exp_name}/{model_type}/src_{src_prompt_txt}/tar_{tar_prompt_txt}"
                 os.makedirs(save_dir, exist_ok=True)
+                output_filename = f"n_min_{n_min}_n_max_{n_max}_src{src_guidance_scale}_tar{tar_guidance_scale}_T_steps_{T_steps}.png"
+                save_path = f"{save_dir}/{output_filename}"
+                image_tar[0].save(save_path)
                 
-                image_tar[0].save(f"{save_dir}/output_T_steps_{T_steps}_n_avg_{n_avg}_cfg_enc_{src_guidance_scale}_cfg_dec{tar_guidance_scale}_n_min_{n_min}_n_max_{n_max}_seed{seed}.png")
-                # also save source and target prompt in txt file
-                with open(f"{save_dir}/prompts.txt", "w") as f:
-                    f.write(f"Source prompt: {src_prompt}\n")
-                    f.write(f"Target prompt: {tar_prompt}\n")
-                    f.write(f"Seed: {seed}\n")
-                    f.write(f"Sampler type: {model_type}\n")
-                
+                # 同时也保存参数信息到 txt (可选，为了防止忘记其他参数)
+                # with open(f"{save_dir}/info.txt", "a") as f:
+                #    f.write(f"{output_filename}: seed={seed}, coupling={coupling_strength}\n")
 
 
 

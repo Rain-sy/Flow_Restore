@@ -1,0 +1,16 @@
+- 
+  exp_name: "FlowEdit_SD3_Denoise"
+  dataset_yaml: single_restore.yaml
+  model_type: "SD3"
+  sampler_type: "FlowEditSD3"
+  T_steps: 10
+  #coupling_strength: 0.8
+  n_avg: 1
+  src_guidance_scale: 3
+  tar_guidance_scale: 3
+  n_min: 0
+  n_max: 6
+  # n_min: 15
+  # n_max: 45
+  seed: 42
+

@@ -1,0 +1,9 @@
+-
+    input_img:  Data/Images/bear_grass.png
+
+    source_prompt: >
+     A large brown bear walking through a grassy field.
+    target_prompts:
+      - A large polar bear walking through a grassy field.
+    target_codes:
+     - polar bear

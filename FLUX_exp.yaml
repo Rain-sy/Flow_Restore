@@ -3,10 +3,12 @@
   dataset_yaml: edits.yaml
   model_type: "FLUX"
   sampler_type: "FlowEditFLUX"
-  T_steps: 28
+  #T_steps: 28
+  T_steps: 20
   n_avg: 1
   src_guidance_scale: 1.5
   tar_guidance_scale: 5.5
   n_min: 0
-  n_max: 24
+  #n_max: 24
+  n_max: 16
   seed: 10

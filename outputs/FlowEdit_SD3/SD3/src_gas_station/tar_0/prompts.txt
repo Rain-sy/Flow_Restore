@@ -1,0 +1,4 @@
+Source prompt: A gas station with a white and red sign that reads "CAFE" There are several cars parked in front of the gas station, including a white car and a van.
+Target prompt: A gas station with a white and red sign that reads "CVPR" There are several cars parked in front of the gas station, including a white car and a van.
+Seed: 42
+Sampler type: SD3

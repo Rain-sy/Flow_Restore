@@ -1,0 +1,14 @@
+-
+    # 假设你把这张噪点图放到了这个路径
+    # input_img:  Data/Noisy_Images/bear_grass.png
+    input_img:  Data/Masked_Images/bear_grass_painted.png
+    source_prompt: >
+      A large brown bear walking through a grassy field, with a black patch covering the body.
+    
+    target_prompts:
+    - >
+      A large brown bear walking through a grassy field.
+      
+
+    target_codes:  #没用
+    - brown bear

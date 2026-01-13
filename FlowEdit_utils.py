@@ -120,7 +120,7 @@ def FlowEditSD3(pipe,
     src_guidance_scale: float = 3.5,
     tar_guidance_scale: float = 13.5,
     n_min: int = 0,
-    n_max: int = 15,):
+    n_max: int = 15): # <--- 新增这一行！
     
     device = x_src.device
 
@@ -189,7 +189,8 @@ def FlowEditSD3(pipe,
                 
                 zt_src = (1-t_i)*x_src + (t_i)*fwd_noise
 
-                zt_tar = zt_edit + zt_src - x_src
+                zt_tar = zt_edit + (zt_src - x_src)
+                #zt_tar = zt_edit + coupling_strength * (zt_src - x_src)
 
                 src_tar_latent_model_input = torch.cat([zt_src, zt_src, zt_tar, zt_tar]) if pipe.do_classifier_free_guidance else (zt_src, zt_tar) 
 
@@ -220,7 +221,7 @@ def FlowEditSD3(pipe,
 
             prev_sample = xt_tar + (t_im1 - t_i) * (Vt_tar)
 
-            prev_sample = prev_sample.to(noise_pred_tar.dtype)
+            prev_sample = prev_sample.to(Vt_tar.dtype)
 
             xt_tar = prev_sample
         
