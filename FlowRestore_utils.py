@@ -46,11 +46,12 @@ def FlowRestoreSD3(
         deg_neg_pooled_prompt_embeds,
     ) = pipe.encode_prompt(
         prompt=degradation_prompt,
+        prompt_2=None,             # <--- 新增: 必须显式传入 None
+        prompt_3=None,             # <--- 新增: 必须显式传入 None
         negative_prompt=negative_prompt,
         do_classifier_free_guidance=pipe.do_classifier_free_guidance,
         device=device,
     )
-
     # Target (Clean) -> 对应原本 FlowEdit 的 tar
     pipe._guidance_scale = clean_guidance_scale
     (
@@ -60,6 +61,8 @@ def FlowRestoreSD3(
         clean_neg_pooled_prompt_embeds,
     ) = pipe.encode_prompt(
         prompt=clean_prompt,
+        prompt_2=None,             # <--- 新增: 必须显式传入 None
+        prompt_3=None,             # <--- 新增: 必须显式传入 None
         negative_prompt=negative_prompt,
         do_classifier_free_guidance=pipe.do_classifier_free_guidance,
         device=device,
@@ -68,8 +71,7 @@ def FlowRestoreSD3(
     # 拼接 Embeddings (用于 Batch 计算)
     # Order: [Neg_Src, Src, Neg_Tar, Tar] -> [Neg_Deg, Deg, Neg_Clean, Clean]
     combined_prompt_embeds = torch.cat([deg_neg_prompt_embeds, deg_prompt_embeds, clean_neg_prompt_embeds, clean_prompt_embeds], dim=0)
-    combined_pooled_embeds = torch.cat([deg_neg_pooled_prompt_embeds, deg_pooled_prompt_embeds, clean_neg_pooled_prompt_embeds, clean_pooled_embeds], dim=0)
-    
+    combined_pooled_embeds = torch.cat([deg_neg_pooled_prompt_embeds, deg_pooled_prompt_embeds, clean_neg_pooled_prompt_embeds, clean_pooled_prompt_embeds], dim=0)
     # 3. 初始化 ODE
     # 在 Restoration 中，我们通常从纯随机噪声开始，或者从 LQ 加噪开始
     # 这里为了配合 FlowEdit 的逻辑（保留结构），我们采用 "Stochastic Encoding" 逻辑

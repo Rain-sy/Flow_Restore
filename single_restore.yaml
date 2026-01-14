@@ -5,7 +5,6 @@
     source_prompt: >
       A noised picture.
     
-
     target_prompts:
     - >
       A denoised picture.

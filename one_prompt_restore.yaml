@@ -1,0 +1,12 @@
+- input_img: "Data/Noisy_Images/bear_grass.png"
+  
+  # Source Prompt (Degradation Prompt)
+  # 描述这张图为什么坏了，越详细越好
+  source_prompt: "A Blurry, gaussian noise, grain image"
+  
+  # Target Prompts (Clean Prompt)
+  # 这是一个列表，你可以测试不同的 Target 策略
+  # 例如：第一个是空字符串(纯减法)，第二个是通用描述
+  target_prompts: 
+    - ""  # 策略1: 纯 Negative Guidance (推荐)
+    - "A denoised image" # 策略2: 显式引导
