@@ -1,19 +1,19 @@
 - 
-  exp_name: "SIDD_Denoise_SD3"
+  exp_name: "SIDD_FLUX_Denoise"
   dataset_yaml: SIDD_dataset.yaml
-  model_type: "SD3"               # 推荐用 SD3，对真实纹理还原较好
-  sampler_type: "FlowEditSD3"
+  model_type: "FLUX"  # 记得改回 FLUX
+  sampler_type: "FlowEditFLUX"
   
   T_steps: 28  # Flux 只要 28 步
   
   # === Flux 去噪策略 ===
   # n_min 不要太大，Flux 重绘能力很强，太大会变样
   # 建议: 28步里的最后 4-8 步
-  n_min: 6
+  n_min: 1
   n_max: 24
-  
+  n_avg: 0
   # Guidance (Flux 不需要像 SD3 那么大)
   src_guidance_scale: 2.0  # 稍微提高一点感知原图噪声
-  tar_guidance_scale: 4.5  # 适中即可
+  tar_guidance_scale: 2.0  # 适中即可
   
   seed: 42
