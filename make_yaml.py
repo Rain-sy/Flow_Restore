@@ -9,8 +9,8 @@ DATASET_ROOT = "Data/SIDD_Small_sRGB_Only/Data"
 OUTPUT_YAML = "SIDD_dataset.yaml"
 
 # 针对智能手机噪声的 Prompt
-SOURCE_PROMPT = "noisy, grainy, smartphone camera noise, high ISO, low light artifacts, chroma noise"
-TARGET_PROMPT = "clean, sharp, high quality, denoised, ground truth, crystal clear"
+SOURCE_PROMPT = "A noised image in grainy, low light conditions"
+TARGET_PROMPT = "A denoised image"
 # =======================================
 
 def generate_yaml():
