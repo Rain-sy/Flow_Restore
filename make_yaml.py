@@ -1,55 +1,50 @@
+import os
 import yaml
-import numpy as np
 
-# ================= 配置区域 =================
-OUTPUT_FILENAME = "grid_search.yaml"
+# ================= 配置 =================
+# SIDD 数据集根目录 (请根据你的实际情况修改)
+# 注意：指向包含很多 "0001_...", "0002_..." 文件夹的那一层
+DATASET_ROOT = "Data/SIDD_Small_sRGB_Only/Data"
 
-# 循环范围 (1.5 到 5.0，步长 0.5)
-# np.arange 的右边界是不包含的，所以写 5.1
-src_range = np.arange(2, 10.1, 2)
-tar_range = np.arange(2, 10.1, 2)
+OUTPUT_YAML = "SIDD_dataset.yaml"
 
-# 固定参数 (基于之前的最佳实践)
-BASE_CONFIG = {
-    "exp_name": "Bear_Grid_Search",    # 所有图会保存在 outputs/Bear_Grid_Search 下
-    "dataset_yaml": "single_restore.yaml", # 指向你的 bear_grass 单图配置
-    
-    # === 模型设置 (如果是 FLUX 请修改这里) ===
-    "model_type": "SD3",
-    "sampler_type": "FlowEditSD3",
-    "T_steps": 30,
-    
-    # === 结构参数 (固定) ===
-    "coupling_strength": 0.75, # 强力锁死结构
-    "n_min": 0,                # 只做最后微调
-    "n_max": 23,
-    "n_avg": 1,
-    "seed": 42
-}
-# ===========================================
+# 针对智能手机噪声的 Prompt
+SOURCE_PROMPT = "noisy, grainy, smartphone camera noise, high ISO, low light artifacts, chroma noise"
+TARGET_PROMPT = "clean, sharp, high quality, denoised, ground truth, crystal clear"
+# =======================================
 
-def generate_grid():
-    experiment_list = []
+def generate_yaml():
+    data_list = []
     
-    print(f"Generating grid search for SRC: {src_range} and TAR: {tar_range}")
+    print(f"Scanning SIDD dataset in: {DATASET_ROOT} ...")
+
+    # 遍历所有子文件夹
+    for root, dirs, files in os.walk(DATASET_ROOT):
+        for file in files:
+            # 只找噪声图 (SIDD 的命名通常包含 NOISY)
+            if "NOISY" in file and file.lower().endswith(".png"):
+                
+                # 构造绝对路径或相对路径
+                img_path = os.path.join(root, file).replace("\\", "/")
+                
+                # 获取父文件夹名 (作为唯一标识的一部分，虽然这里只生成 yaml，
+                # 但配合刚才修改的 run_script.py 就能完美工作)
+                folder_name = os.path.basename(root)
+                
+                entry = {
+                    "input_img": img_path,
+                    "source_prompt": SOURCE_PROMPT,
+                    "target_prompts": [TARGET_PROMPT],
+                    # 使用 文件夹名 作为 target code，方便追踪
+                    "target_codes": [f"{folder_name}_restored"]
+                }
+                data_list.append(entry)
+
+    # 保存
+    with open(OUTPUT_YAML, 'w') as f:
+        yaml.dump(data_list, f, sort_keys=False, default_flow_style=False)
     
-    for src in src_range:
-        for tar in tar_range:
-            # 复制一份基础配置
-            config = BASE_CONFIG.copy()
-            
-            # 设置动态变化的参数
-            # 注意：必须转为 python float，否则 yaml 保存 numpy float 会很难看
-            config["src_guidance_scale"] = round(float(src), 2)
-            config["tar_guidance_scale"] = round(float(tar), 2)
-            
-            experiment_list.append(config)
-            
-    # 保存为 YAML
-    with open(OUTPUT_FILENAME, "w", encoding='utf-8') as f:
-        yaml.dump(experiment_list, f, sort_keys=False, default_flow_style=False)
-        
-    print(f"Done! Generated {len(experiment_list)} experiments in '{OUTPUT_FILENAME}'")
+    print(f"Done! Found {len(data_list)} images. Saved to {OUTPUT_YAML}")
 
 if __name__ == "__main__":
-    generate_grid()
+    generate_yaml()

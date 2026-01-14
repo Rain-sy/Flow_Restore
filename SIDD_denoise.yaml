@@ -1,0 +1,16 @@
+- 
+  exp_name: "SIDD_Denoise_SD3"
+  dataset_yaml: sidd_dataset.yaml
+  model_type: "SD3"               # 推荐用 SD3，对真实纹理还原较好
+  sampler_type: "FlowEditSD3"
+  
+  T_steps: 40
+  n_min: 0
+  n_max: 33
+  
+  # 3. 增强 Target 引导
+  # 因为没有了 coupling_strength 的物理松绑，我们需要更强的 Prompt 力量来把画质拉向干净
+  tar_guidance_scale: 3.5
+  src_guidance_scale: 3.5
+  
+  # Prompt 依然要保持 "noisy" vs "clean" 的对比
