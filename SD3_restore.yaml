@@ -8,19 +8,19 @@
   # --- 关键参数 ---
   # CFG @ src: 告诉模型"多大程度上减去这个模糊概念"
   # 建议值: 3.5 ~ 7.5
-  degradation_guidance_scale: 3.5
+  degradation_guidance_scale: 2.5
   
   # CFG @ tar: 告诉模型"多大程度上生成清晰概念"
   # 如果 target prompt 是空的或者很简单，保持 1.0 即可
-  clean_guidance_scale: 1.5
+  clean_guidance_scale: 2.5
   
   # 正则化力度 (Regularization Lambda)
   # 建议值: 50.0 ~ 200.0 (太大会导致复原不出纹理，太小会导致幻觉)
-  reg_scale: 75.0
+  reg_scale: 150.0
   
   # 步数范围 (Restoration 建议跑满)
   n_min: 0
-  n_max: 45
+  n_max: 35
   
   seed: 42
   

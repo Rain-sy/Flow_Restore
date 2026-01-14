@@ -11,7 +11,7 @@ GT_PATH = "Data/Images/bear_grass.png"
 
 # 2. 结果图片所在的文件夹 (脚本会计算这里面所有图片)
 #RESTORED_DIR = "outputs/Bear_Grid_Search/SD3/src_bear_grass/tar_0"
-RESTORED_DIR = "outputs/SD3_Restoration_01/SD3/src_bear_grass/tar_1"
+RESTORED_DIR = "outputs/SD3_Restoration_01/SD3/src_bear_grass/tar_0"
 #RESTORED_DIR = "outputs/FlowEdit_SD3_Denoise/SD3/src_bear_grass_painted/tar_0"
 # 3. 是否只在 Y 通道(亮度)上计算？(学术标准通常为 True)
 TEST_Y_CHANNEL = True
