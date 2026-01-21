@@ -1,5 +1,5 @@
 - 
-  exp_name: "SIDD_FLUX_Denoise"
+  exp_name: "SIDD_Denoise"
   dataset_yaml: SIDD_dataset.yaml
   model_type: "FLUX"  # 记得改回 FLUX
   sampler_type: "FlowEditFLUX"

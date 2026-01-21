@@ -1,200 +1,391 @@
+from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
+from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
+import numpy as np
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 
-# 复用原本的 calc_v_sd3，不需要修改它
-from FlowEdit_utils import calc_v_sd3
+# =========================================================================
+# Helper Functions
+# =========================================================================
 
+def scale_noise(
+    scheduler,
+    sample: torch.FloatTensor,
+    timestep: Union[float, torch.FloatTensor],
+    noise: Optional[torch.FloatTensor] = None,
+) -> torch.FloatTensor:
+    """Forward process in flow-matching (SD3 specific)"""
+    scheduler._init_step_index(timestep)
+    sigma = scheduler.sigmas[scheduler.step_index]
+    sample = sigma * noise + (1.0 - sigma) * sample
+    return sample
+
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.16,
+):
+    """Shift calculation for FLUX scheduler"""
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+def degradation_fn(z0_hat, target_size=None):
+    """
+    Downsampling operator for regularization.
+    Uses Area interpolation for better gradient stability.
+    """
+    if target_size is None:
+        return z0_hat
+    return F.interpolate(z0_hat, size=target_size, mode='area')
+
+def unpack_latents_flux_manual(latents, height, width, vae_scale_factor):
+    """
+    手动实现 FLUX 的 Unpack 逻辑，避免 diffusers 版本差异导致的尺寸报错。
+    将 Packed Latents [B, Seq, C_packed] 还原为 Spatial Latents [B, C, H, W]
+    """
+    batch_size, seq_len, channels_packed = latents.shape
+    
+    # 计算 Latent 的实际尺寸 (H, W)
+    h_lat = height // vae_scale_factor
+    w_lat = width // vae_scale_factor
+    
+    # FLUX Pack 操作会将 2x2 的像素块折叠进通道
+    # 所以 Grid 的尺寸是 Latent 尺寸的一半
+    h_grid = h_lat // 2
+    w_grid = w_lat // 2
+    
+    # 检查通道数 (通常是 16 * 4 = 64)
+    channels = channels_packed // 4
+    
+    # 1. View 还原为 Grid [B, H/2, W/2, C, 2, 2]
+    # 这里我们显式使用 h_grid, w_grid，保证 size 匹配
+    latents = latents.view(batch_size, h_grid, w_grid, channels, 2, 2)
+    
+    # 2. Permute 调整维度顺序 [B, C, H/2, 2, W/2, 2]
+    latents = latents.permute(0, 3, 1, 4, 2, 5)
+    
+    # 3. Reshape 合并空间维度 [B, C, H, W]
+    latents = latents.reshape(batch_size, channels, h_lat, w_lat)
+    
+    return latents
+
+# =========================================================================
+# V-Prediction Wrappers
+# =========================================================================
+
+def calc_v_sd3(pipe, latent_model_input, prompt_embeds, pooled_prompt_embeds, src_guidance_scale, tar_guidance_scale, t):
+    timestep = t.expand(latent_model_input.shape[0])
+
+    with torch.no_grad():
+        noise_pred = pipe.transformer(
+            hidden_states=latent_model_input,
+            timestep=timestep,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=pooled_prompt_embeds,
+            joint_attention_kwargs=None,
+            return_dict=False,
+        )[0]
+
+        src_noise_pred_uncond, src_noise_pred_text, tar_noise_pred_uncond, tar_noise_pred_text = noise_pred.chunk(4)
+        
+        noise_pred_src = src_noise_pred_uncond + src_guidance_scale * (src_noise_pred_text - src_noise_pred_uncond)
+        noise_pred_tar = tar_noise_pred_uncond + tar_guidance_scale * (tar_noise_pred_text - tar_noise_pred_uncond)
+
+    return noise_pred_src, noise_pred_tar
+
+def calc_v_flux(pipe, latents, prompt_embeds, pooled_prompt_embeds, guidance, text_ids, latent_image_ids, t):
+    timestep = t.expand(latents.shape[0])
+
+    with torch.no_grad():
+        noise_pred = pipe.transformer(
+            hidden_states=latents,
+            timestep=timestep / 1000,
+            guidance=guidance,
+            encoder_hidden_states=prompt_embeds,
+            txt_ids=text_ids,
+            img_ids=latent_image_ids,
+            pooled_projections=pooled_prompt_embeds,
+            joint_attention_kwargs=None,
+            return_dict=False,
+        )[0]
+
+    return noise_pred
+
+# =========================================================================
+# Main Restoration Functions
+# =========================================================================
+
+@torch.no_grad()
 def FlowRestoreSD3(
     pipe,
     scheduler,
-    x_lq,                      # 输入的低质量图像 (Latent)
-    degradation_prompt,        # 描述退化的Prompt，例如 "Blurry, noise, low quality"
-    clean_prompt="",           # 描述目标的Prompt，通常留空 ("") 或者写 "High quality"
-    negative_prompt="",        # 通用负面词，例如 "Artifacts"
+    x_lq,                      
+    degradation_prompt,        
+    clean_prompt="",           
+    negative_prompt="",        
     T_steps: int = 50,
-    n_avg: int = 1,
-    degradation_guidance_scale: float = 3.5, # 控制“减去噪音”的力度 (对应原本的 src_guidance)
-    clean_guidance_scale: float = 1.0,       # 控制“趋向清晰”的力度，如果 clean_prompt为空，建议设为1.0
+    n_avg: int = 0,
+    degradation_guidance_scale: float = 2.5, 
+    clean_guidance_scale: float = 2.5,       
     n_min: int = 0,
-    n_max: int = 50,           # Restoration 通常建议跑完全程
-    # --- 新增：Regularization 参数 ---
-    reg_scale: float = 200.0,  # 正则化力度 (Lambda)。越大越强行保持原图结构，太大会导致伪影
-    degradation_fn = None      # 退化算子。如果为None，默认为Identity (适用于Denoising)
+    n_max: int = 24,
+    reg_scale: float = 200,  
+    degradation_fn = None,      
+    adaptive_tolerance: float = 0.0001, 
+    min_inference_steps: int = 15
 ):
-    """
-    FlowRestore: Based on FlowEdit, optimized for Image Restoration with Regularization.
-    
-    Logic: 
-    1. Flow Direction = V(Clean) - V(Degradation)
-    2. Regularization = || Degrade(Estimated_Z0) - Input_LQ ||^2
-    """
-    
-    # 1. 准备 Latents 和 Timesteps
     device = x_lq.device
+    
     timesteps, T_steps = retrieve_timesteps(scheduler, T_steps, device, timesteps=None)
     pipe._num_timesteps = len(timesteps)
     
-    # 2. Encode Prompts (Feature Extraction)
-    # Source (Degradation) -> 对应原本 FlowEdit 的 src
     pipe._guidance_scale = degradation_guidance_scale
     (
-        deg_prompt_embeds,
-        deg_neg_prompt_embeds,
-        deg_pooled_prompt_embeds,
-        deg_neg_pooled_prompt_embeds,
+        deg_prompt_embeds, deg_neg_prompt_embeds, deg_pooled_prompt_embeds, deg_neg_pooled_prompt_embeds,
     ) = pipe.encode_prompt(
-        prompt=degradation_prompt,
-        prompt_2=None,             # <--- 新增: 必须显式传入 None
-        prompt_3=None,             # <--- 新增: 必须显式传入 None
-        negative_prompt=negative_prompt,
-        do_classifier_free_guidance=pipe.do_classifier_free_guidance,
-        device=device,
+        prompt=degradation_prompt, prompt_2=None, prompt_3=None, 
+        negative_prompt=negative_prompt, do_classifier_free_guidance=True, device=device,
     )
-    # Target (Clean) -> 对应原本 FlowEdit 的 tar
+
     pipe._guidance_scale = clean_guidance_scale
     (
-        clean_prompt_embeds,
-        clean_neg_prompt_embeds,
-        clean_pooled_prompt_embeds,
-        clean_neg_pooled_prompt_embeds,
+        clean_prompt_embeds, clean_neg_prompt_embeds, clean_pooled_prompt_embeds, clean_neg_pooled_prompt_embeds,
     ) = pipe.encode_prompt(
-        prompt=clean_prompt,
-        prompt_2=None,             # <--- 新增: 必须显式传入 None
-        prompt_3=None,             # <--- 新增: 必须显式传入 None
-        negative_prompt=negative_prompt,
-        do_classifier_free_guidance=pipe.do_classifier_free_guidance,
-        device=device,
+        prompt=clean_prompt, prompt_2=None, prompt_3=None,
+        negative_prompt=negative_prompt, do_classifier_free_guidance=True, device=device,
     )
     
-    # 拼接 Embeddings (用于 Batch 计算)
-    # Order: [Neg_Src, Src, Neg_Tar, Tar] -> [Neg_Deg, Deg, Neg_Clean, Clean]
     combined_prompt_embeds = torch.cat([deg_neg_prompt_embeds, deg_prompt_embeds, clean_neg_prompt_embeds, clean_prompt_embeds], dim=0)
     combined_pooled_embeds = torch.cat([deg_neg_pooled_prompt_embeds, deg_pooled_prompt_embeds, clean_neg_pooled_prompt_embeds, clean_pooled_prompt_embeds], dim=0)
-    # 3. 初始化 ODE
-    # 在 Restoration 中，我们通常从纯随机噪声开始，或者从 LQ 加噪开始
-    # 这里为了配合 FlowEdit 的逻辑（保留结构），我们采用 "Stochastic Encoding" 逻辑
-    # Zt_edit 初始化为 x_lq (这一点和 FlowEdit 一样，作为 ODE 的锚点)
+    
+    pipe._guidance_scale = 1.5 
+    
     zt_edit = x_lq.clone()
+    target_size = (x_lq.shape[2], x_lq.shape[3]) 
+    prev_z0_hat = None
 
-    iterator = tqdm(enumerate(timesteps), total=len(timesteps), desc="FlowRestoring")
+    iterator = tqdm(enumerate(timesteps), total=len(timesteps), desc="FlowRestoring SD3")
     
     for i, t in iterator:
-        
-        # 跳过不在范围内的时间步
         if T_steps - i > n_max: continue
         
-        # 获取当前时间步数值 (0~1)
         t_i = t / 1000.0
-        # 获取下一个时间步 (用于计算 dt)
         if i + 1 < len(timesteps):
             t_im1 = (timesteps[i+1]) / 1000.0
         else:
-            t_im1 = torch.zeros_like(t_i).to(device) # 最后一步走到 0
+            t_im1 = torch.zeros_like(t_i).to(device)
             
-        dt = t_im1 - t_i # 注意：时间倒流，dt 是负数
+        dt = t_im1 - t_i
 
-        # -------------------------------------------------------
-        # Part A: FlowEdit 核心 (计算编辑方向)
-        # -------------------------------------------------------
-        
-        # 这里的逻辑和原版 FlowEdit 保持一致：
-        # 1. 构造 stochastic path (zt_src)
-        # 2. 计算 V_clean - V_degradation
-        
         if T_steps - i > n_min:
             V_delta_avg = torch.zeros_like(x_lq)
-            
-            # 开启梯度计算 (为了 Regularization)
-            # 必须设置 requires_grad=True，否则无法对 zt_edit 求导
             zt_edit_grad = zt_edit.detach().requires_grad_(True)
             
             for k in range(n_avg):
-                # 随机采样噪声
                 fwd_noise = torch.randn_like(x_lq).to(device)
-                
-                # 构造 Source Path (Degraded Path)
                 zt_src = (1 - t_i) * x_lq + t_i * fwd_noise
+                zt_tar = zt_edit_grad + (zt_src - x_lq) 
                 
-                # 构造 Target Path (Restored Path) - Coupling
-                zt_tar = zt_edit_grad + (zt_src - x_lq)
+                latent_input = torch.cat([zt_src, zt_src, zt_tar, zt_tar])
                 
-                # Batch input for SD3
-                latent_input = torch.cat([zt_src, zt_src, zt_tar, zt_tar]) if pipe.do_classifier_free_guidance else (zt_src, zt_tar)
-                
-                # 计算速度场
-                # Vt_deg (Src), Vt_clean (Tar)
                 Vt_deg, Vt_clean = calc_v_sd3(
                     pipe, latent_input, 
                     combined_prompt_embeds, combined_pooled_embeds, 
                     degradation_guidance_scale, clean_guidance_scale, t
                 )
                 
-                # 核心减法逻辑：Direction = V_clean - V_degradation
                 V_delta_avg += (1/n_avg) * (Vt_clean - Vt_deg)
 
-            # -------------------------------------------------------
-            # Part B: Regularization (数据一致性校正)
-            # -------------------------------------------------------
-            reg_grad = torch.zeros_like(zt_edit)
+            z0_hat = zt_edit_grad - t_i * V_delta_avg
             
+            if adaptive_tolerance > 0 and i >= min_inference_steps:
+                if prev_z0_hat is not None:
+                    diff = torch.mean((z0_hat.detach().float() - prev_z0_hat.float()) ** 2).item()
+                    iterator.set_postfix({"Diff": f"{diff:.2e}"})
+                    if diff < adaptive_tolerance:
+                        print(f"\n[Adaptive Stop] Converged at step {i}/{T_steps}")
+                        return z0_hat.detach()
+                prev_z0_hat = z0_hat.detach().clone()
+            
+            reg_grad = torch.zeros_like(zt_edit)
             if reg_scale > 0:
-                # 1. 估计当前的 Z0 (Clean Latent)
-                # 根据 Rectified Flow 公式: Zt = t*Noise + (1-t)*Z0
-                # 所以: dZ/dt = v = Noise - Z0  =>  Z0 = Noise - v
-                # 或者更通用的: Z0 = Zt - t * v
-                # 注意：这里我们用 V_delta_avg 作为当前轨迹的最佳估计速度
-                
-                # 我们需要使用 zt_tar 对应的速度来估计，这里简化使用 V_delta
-                # 更好的做法是用 Vt_clean，但为了节省计算，我们用当前的编辑流近似
-                z0_hat = zt_edit_grad - t_i * V_delta_avg
-                
-                # 2. 应用退化模型 (Degradation)
                 if degradation_fn is None:
-                    # 默认为 Identity (Denoising 任务)
                     z0_degraded = z0_hat
                 else:
-                    # 如果是 Deblur/SR，这里应该是 Blur(z0_hat) 或 Downsample(z0_hat)
-                    z0_degraded = degradation_fn(z0_hat)
+                    z0_degraded = degradation_fn(z0_hat, target_size)
                 
-                # 3. 计算 Loss: || D(Z0_hat) - Input_LQ ||^2
                 loss_reg = F.mse_loss(z0_degraded, x_lq.detach())
-                
-                # 4. 计算梯度: d(Loss)/d(zt_edit)
-                # 这个梯度告诉我们：zt_edit 应该怎么动，才能让解出来的 Z0 更像原图
                 reg_grad = torch.autograd.grad(loss_reg, zt_edit_grad)[0]
-                
-                # 打印 Loss 方便监控 (可选)
-                # if i % 10 == 0: print(f"Step {i}, Reg Loss: {loss_reg.item():.6f}")
 
-            # -------------------------------------------------------
-            # Part C: 更新步 (Update Step)
-            # -------------------------------------------------------
-            
-            # zt_next = zt + dt * v
-            # 加入 Regularization: 相当于在速度场上加了一个纠正力
-            # dt 是负数，我们希望 Loss 变小，梯度下降方向是 -grad
-            # 所以我们把 -grad 加到 velocity 上？
-            # 实际上，这相当于 Langevin Dynamics 的校正项
-            
-            zt_edit = zt_edit.detach() # 截断梯度，准备下一步
-            
-            # 更新公式：
-            # 1. Flow 推力: dt * V_delta_avg
-            # 2. Reg 拉力:  - reg_scale * reg_grad * abs(dt) 
-            # (注意符号：我们需要让 zt 往 loss 减小的方向走)
-            
-            correction =  - reg_scale * reg_grad 
-            
-            # 更新 Latent
+            zt_edit = zt_edit.detach()
+            correction = - reg_scale * reg_grad
             zt_edit = zt_edit + dt * (V_delta_avg + correction)
             
         else:
-            # 最后的步骤 (通常用于 Refine)
-            # 这里简化处理，可以保留 Regularization 也可以去掉
-            # 为了保持一致性，建议去掉 Reg，只做最后的小修补
-            # ... (保留原本 FlowEdit 的最后几步逻辑，或者直接跳过)
             pass
 
     return zt_edit
+
+
+@torch.no_grad()
+def FlowRestoreFLUX(
+    pipe,
+    scheduler,
+    x_lq,                      # Input Latent [B, C, H, W]
+    degradation_prompt,
+    clean_prompt="",
+    T_steps: int = 28,
+    n_avg: int = 1,  #must > 0?
+    degradation_guidance_scale: float = 2.0,
+    clean_guidance_scale: float = 2.0,
+    n_min: int = 0,
+    n_max: int = 22,
+    reg_scale: float = 0.0,
+    degradation_fn = None,
+    adaptive_tolerance: float = 0.0,
+    min_inference_steps: int = 10
+):
+    device = x_lq.device
+    dtype = x_lq.dtype
+    
+    # 1. Pack Latents
+    num_channels_latents = x_lq.shape[1]
+    # pipe._pack_latents 应该是稳定的，因为它只需要 latent 的 H/W
+    x_lq_packed = pipe._pack_latents(x_lq, x_lq.shape[0], num_channels_latents, x_lq.shape[2], x_lq.shape[3])
+    
+    # 2. Prepare Timesteps
+    sigmas = np.linspace(1.0, 1 / T_steps, T_steps)
+    image_seq_len = x_lq_packed.shape[1]
+    mu = calculate_shift(
+        image_seq_len,
+        scheduler.config.base_image_seq_len,
+        scheduler.config.max_image_seq_len,
+        scheduler.config.base_shift,
+        scheduler.config.max_shift,
+    )
+    timesteps, T_steps = retrieve_timesteps(
+        scheduler, T_steps, device, timesteps=None, sigmas=sigmas, mu=mu,
+    )
+    pipe._num_timesteps = len(timesteps)
+
+    # 3. Encode Prompts
+    (deg_prompt_embeds, deg_pooled_prompt_embeds, deg_text_ids) = pipe.encode_prompt(
+        prompt=degradation_prompt, prompt_2=None, device=device
+    )
+    (clean_prompt_embeds, clean_pooled_prompt_embeds, clean_text_ids) = pipe.encode_prompt(
+        prompt=clean_prompt, prompt_2=None, device=device
+    )
+
+    # 4. Guidance
+    if pipe.transformer.config.guidance_embeds:
+        deg_guidance = torch.tensor([degradation_guidance_scale], device=device).expand(x_lq_packed.shape[0])
+        clean_guidance = torch.tensor([clean_guidance_scale], device=device).expand(x_lq_packed.shape[0])
+    else:
+        deg_guidance = None
+        clean_guidance = None
+
+    # 5. Image IDs
+    latent_image_ids = pipe._prepare_latent_image_ids(
+        x_lq.shape[0], x_lq.shape[2], x_lq.shape[3], device, dtype
+    )
+
+    # 6. Initialize Loop
+    zt_edit = x_lq_packed.clone()
+    prev_z0_hat = None
+
+    iterator = tqdm(enumerate(timesteps), total=len(timesteps), desc="FlowRestoring FLUX")
+    
+    for i, t in iterator:
+        if T_steps - i > n_max: continue
+        
+        scheduler._init_step_index(t)
+        t_i = scheduler.sigmas[scheduler.step_index]
+        if i + 1 < len(timesteps):
+            t_im1 = scheduler.sigmas[scheduler.step_index + 1]
+        else:
+            t_im1 = t_i
+        dt = t_im1 - t_i
+
+        if T_steps - i > n_min:
+            V_delta_avg = torch.zeros_like(x_lq_packed)
+            zt_edit_grad = zt_edit.detach().requires_grad_(True)
+            
+            for k in range(n_avg):
+                fwd_noise = torch.randn_like(x_lq_packed).to(device)
+                zt_src = (1 - t_i) * x_lq_packed + t_i * fwd_noise
+                zt_tar = zt_edit_grad + (zt_src - x_lq_packed)
+                
+                Vt_deg = calc_v_flux(
+                    pipe, zt_src, deg_prompt_embeds, deg_pooled_prompt_embeds, 
+                    deg_guidance, deg_text_ids, latent_image_ids, t
+                )
+                Vt_clean = calc_v_flux(
+                    pipe, zt_tar, clean_prompt_embeds, clean_pooled_prompt_embeds, 
+                    clean_guidance, clean_text_ids, latent_image_ids, t
+                )
+                
+                V_delta_avg += (1/n_avg) * (Vt_clean - Vt_deg)
+
+            # --- Regularization & Stop Check ---
+            z0_hat_packed = zt_edit_grad - t_i * V_delta_avg
+            
+            if adaptive_tolerance > 0 and i >= min_inference_steps:
+                if prev_z0_hat is not None:
+                    diff = torch.mean((z0_hat_packed.detach() - prev_z0_hat) ** 2).item()
+                    iterator.set_postfix({"Diff": f"{diff:.2e}"})
+                    if diff < adaptive_tolerance:
+                        print(f"\n[Adaptive Stop] Converged at step {i}/{T_steps}")
+                        # 使用手动 Unpack
+                        return unpack_latents_flux_manual(
+                            z0_hat_packed.detach(), 
+                            x_lq.shape[2] * pipe.vae_scale_factor, 
+                            x_lq.shape[3] * pipe.vae_scale_factor, 
+                            pipe.vae_scale_factor
+                        )
+                prev_z0_hat = z0_hat_packed.detach().clone()
+
+            # Regularization
+            reg_grad = torch.zeros_like(zt_edit)
+            if reg_scale > 0:
+                # 使用手动 Unpack
+                z0_hat_spatial = unpack_latents_flux_manual(
+                    z0_hat_packed, 
+                    x_lq.shape[2] * pipe.vae_scale_factor, 
+                    x_lq.shape[3] * pipe.vae_scale_factor, 
+                    pipe.vae_scale_factor
+                )
+                
+                if degradation_fn is None:
+                    z0_degraded = z0_hat_spatial
+                else:
+                    z0_degraded = degradation_fn(z0_hat_spatial)
+                
+                loss_reg = F.mse_loss(z0_degraded, x_lq.detach())
+                reg_grad = torch.autograd.grad(loss_reg, zt_edit_grad)[0]
+
+            zt_edit = zt_edit.detach()
+            correction = - reg_scale * reg_grad
+            zt_edit = zt_edit + dt * (V_delta_avg + correction)
+            
+        else:
+            Vt_clean = calc_v_flux(
+                pipe, zt_edit, clean_prompt_embeds, clean_pooled_prompt_embeds, 
+                clean_guidance, clean_text_ids, latent_image_ids, t
+            )
+            zt_edit = zt_edit + dt * Vt_clean
+
+    # Final Unpack 使用手动函数
+    x_out_spatial = unpack_latents_flux_manual(
+        zt_edit, 
+        x_lq.shape[2] * pipe.vae_scale_factor, 
+        x_lq.shape[3] * pipe.vae_scale_factor, 
+        pipe.vae_scale_factor
+    )
+    
+    return x_out_spatial

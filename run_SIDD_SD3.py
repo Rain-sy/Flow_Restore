@@ -6,162 +6,214 @@ import random
 import numpy as np
 import yaml
 import os
-# 只需要导入 SD3 的工具
+import math
+from tqdm import tqdm
+# 导入 SD3 工具
 from FlowEdit_utils import FlowEditSD3
 
+def load_yaml(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
+
+def process_tile_sd3(pipe, scheduler, image_tile, prompt_config, run_args, device):
+    """
+    处理单个 1024x1024 的小块 (SD3 版本)
+    """
+    # 1. 预处理
+    # SD3 需要宽和高是 16 的倍数 (虽然 1024 肯定是，但加个保险)
+    w, h = image_tile.size
+    w = w - (w % 16)
+    h = h - (h % 16)
+    if w != image_tile.size[0] or h != image_tile.size[1]:
+        image_tile = image_tile.crop((0, 0, w, h))
+
+    image_src = pipe.image_processor.preprocess(image_tile)
+    image_src = image_src.to(device).half()
+    
+    # 2. VAE 编码
+    with torch.autocast("cuda"), torch.inference_mode():
+        x0_src_denorm = pipe.vae.encode(image_src).latent_dist.mode()
+    
+    x0_src = (x0_src_denorm - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+
+    # 3. FlowEdit SD3 修复
+    # 注意：这里不再传递 coupling_strength
+    x0_tar = FlowEditSD3(
+        pipe,
+        scheduler,
+        x0_src,
+        src_prompt=prompt_config["source"],
+        tar_prompt=prompt_config["target"],
+        negative_prompt="", # SD3 默认空负面提示词
+        T_steps=run_args["steps"],
+        n_avg=1,
+        src_guidance_scale=run_args["src_cfg"],
+        tar_guidance_scale=run_args["tar_cfg"],
+        n_min=run_args["n_min"],
+        n_max=run_args["n_max"]
+    )
+
+    # 4. VAE 解码
+    x0_tar_denorm = (x0_tar / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
+    with torch.autocast("cuda"), torch.inference_mode():
+        image_tar = pipe.vae.decode(x0_tar_denorm, return_dict=False)[0]
+    
+    # 转回 Tensor (C, H, W) 范围 [0, 1]，方便拼图
+    # image_tar 是 [-1, 1]，需要 denormalize
+    image_tar = (image_tar / 2 + 0.5).clamp(0, 1).cpu().squeeze(0)
+    return image_tar
+
+def tiled_inference_sd3(pipe, scheduler, image_path, prompt_config, args, device):
+    """
+    核心分块逻辑：滑窗处理 + 加权融合
+    """
+    full_image = Image.open(image_path).convert("RGB")
+    W, H = full_image.size
+    
+    # === 分块配置 ===
+    # SD3 最佳分辨率是 1024
+    TILE_SIZE = 1024    
+    # 步长 768，意味着有 256px 的重叠区域用于平滑接缝
+    STRIDE = 768        
+    
+    # 创建大画布 (累加器)
+    full_canvas = torch.zeros((3, H, W), dtype=torch.float32)
+    count_canvas = torch.zeros((3, H, W), dtype=torch.float32)
+
+    print(f"   🧩 Tiling: {W}x{H} -> Grid with {TILE_SIZE}x{TILE_SIZE} tiles...")
+
+    # 生成滑窗坐标
+    h_starts = list(range(0, H - TILE_SIZE + 1, STRIDE))
+    if (H - TILE_SIZE) % STRIDE != 0: h_starts.append(H - TILE_SIZE)
+    
+    w_starts = list(range(0, W - TILE_SIZE + 1, STRIDE))
+    if (W - TILE_SIZE) % STRIDE != 0: w_starts.append(W - TILE_SIZE)
+    
+    h_starts = sorted(list(set(h_starts)))
+    w_starts = sorted(list(set(w_starts)))
+
+    total_tiles = len(h_starts) * len(w_starts)
+    pbar = tqdm(total=total_tiles, desc="Processing Tiles", leave=False)
+
+    for y in h_starts:
+        for x in w_starts:
+            # 1. 切片
+            box = (x, y, x + TILE_SIZE, y + TILE_SIZE)
+            tile_pil = full_image.crop(box)
+            
+            # 2. 处理 (FlowEdit SD3)
+            tile_tensor = process_tile_sd3(
+                pipe, scheduler, tile_pil, 
+                prompt_config, 
+                args, 
+                device
+            )
+            
+            # 3. 拼回去
+            full_canvas[:, y:y+TILE_SIZE, x:x+TILE_SIZE] += tile_tensor
+            count_canvas[:, y:y+TILE_SIZE, x:x+TILE_SIZE] += 1.0
+            
+            pbar.update(1)
+    
+    pbar.close()
+
+    # 4. 取平均
+    result_tensor = full_canvas / count_canvas
+    
+    # 转回 PIL
+    result_img = result_tensor.permute(1, 2, 0).numpy() # (H, W, 3)
+    result_img = (result_img * 255).astype(np.uint8)
+    return Image.fromarray(result_img)
+
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device_number", type=int, default=0, help="device number to use")
-    parser.add_argument("--exp_yaml", type=str, default="sidd_denoise.yaml", help="experiment yaml file")
+    parser.add_argument("--device_number", type=int, default=0, help="GPU ID")
+    parser.add_argument("--exp_yaml", type=str, default="sidd_denoise.yaml")
+    args_cli = parser.parse_args()
+    
+    device = torch.device(f"cuda:{args_cli.device_number}" if torch.cuda.is_available() else "cpu")
+    exp_configs = load_yaml(args_cli.exp_yaml)
 
-    args = parser.parse_args()
+    print(f"🚀 Initializing SD3 Tiled Restoration (Server Mode)...")
 
-    # set device
-    device_number = args.device_number
-    # 这里定义 device 变量，但后面主要靠 cpu_offload 管理
-    device = torch.device(f"cuda:{device_number}" if torch.cuda.is_available() else "cpu")
-
-    # load exp yaml file to dict
-    exp_yaml = args.exp_yaml
-    with open(exp_yaml, encoding='utf-8') as file:
-        exp_configs = yaml.load(file, Loader=yaml.FullLoader)
-
-    print(f"🚀 Initializing SD3 for SIDD Restoration...")
-
-    # 1. 加载 SD3 模型
-    # 既然只用 SD3，直接写死加载逻辑，不再判断 model_type
+    # 加载 SD3
     pipe = StableDiffusion3Pipeline.from_pretrained(
         "stabilityai/stable-diffusion-3-medium-diffusers", 
         torch_dtype=torch.float16
     )
     
-    scheduler = pipe.scheduler
+    # 服务器模式：直接上 GPU
+    try:
+        pipe.to(device)
+        print("⚡ Model loaded directly to GPU")
+    except:
+        print("⚠️ Falling back to CPU Offload")
+        pipe.enable_model_cpu_offload()
     
-    # 2. 开启 CPU Offload (8GB 显存优化)
-    print("💡 Enabling Model CPU Offload...")
-    pipe.enable_model_cpu_offload()
+    scheduler = pipe.scheduler
 
     for exp_dict in exp_configs:
-
-        exp_name = exp_dict["exp_name"]
-        model_type = "SD3" # 固定为 SD3
+        exp_name = exp_dict.get("exp_name", "SD3_Tiled")
         
-        T_steps = exp_dict["T_steps"]
-        n_avg = exp_dict["n_avg"]
-        src_guidance_scale = exp_dict["src_guidance_scale"]
-        tar_guidance_scale = exp_dict["tar_guidance_scale"]
-        n_min = exp_dict["n_min"]
-        n_max = exp_dict["n_max"]
-        seed = exp_dict["seed"]
-
-        # set seed
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        # 提取参数
+        run_args = {
+            "steps": exp_dict.get("T_steps", 50),
+            "n_min": exp_dict.get("n_min", 20),
+            "n_max": exp_dict.get("n_max", 45),
+            "src_cfg": exp_dict.get("src_guidance_scale", 4.5),
+            "tar_cfg": exp_dict.get("tar_guidance_scale", 9.0)
+        }
         
-        dataset_yaml = exp_dict["dataset_yaml"]
-        with open(dataset_yaml, encoding='utf-8') as file:
-            dataset_configs = yaml.load(file, Loader=yaml.FullLoader)
+        seed = exp_dict.get("seed", 42)
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-        # 遍历数据集图片
+        dataset_configs = load_yaml(exp_dict["dataset_yaml"])
+
         for data_dict in dataset_configs:
-
-            src_prompt = data_dict["source_prompt"]
-            tar_prompts = data_dict["target_prompts"]
-            
-            # 获取 target_codes (如果 YAML 里有就用，没有就用索引)
-            target_codes = data_dict.get("target_codes", [])
-            
-            negative_prompt = "" 
             image_src_path = data_dict["input_img"]
-
-            # check image existence
-            if not os.path.exists(image_src_path):
-                print(f"❌ Error: Image not found: {image_src_path}")
+            
+            # ================= 关键修改：筛选逻辑 =================
+            # 这里的逻辑是：检查路径字符串中是否包含 "_N" 
+            # (SIDD 命名习惯: ..._3200_N, ..._4400_L)
+            # 如果不包含，就跳过
+            if "_N" not in image_src_path and "_N/" not in image_src_path:
+                # print(f"Skipping non-'N' image: {image_src_path}")
                 continue
+            # ====================================================
 
-            # load image
-            # 强制转 RGB，防止 PNG 的 Alpha 通道导致报错
-            image = Image.open(image_src_path).convert("RGB")
+            if not os.path.exists(image_src_path): continue
+
+            # 准备 Prompt
+            prompt_config = {
+                "source": data_dict["source_prompt"],
+                "target": data_dict["target_prompts"][0]
+            }
             
-            # crop image to have both dimensions divisibe by 16
-            # 使用 LANCZOS 缩放通常比直接 crop 更好，但保留你的 crop 逻辑也行
-            # 这里稍微优化了一下逻辑，确保 crop 不会出错
-            w, h = image.size
-            new_w = w - (w % 16)
-            new_h = h - (h % 16)
-            if new_w != w or new_h != h:
-                image = image.crop((0, 0, new_w, new_h))
-            
-            image_src = pipe.image_processor.preprocess(image)
-            
-            # cast image to half precision
-            image_src = image_src.to(device).half()
-            
-            # VAE Encode
-            with torch.autocast("cuda"), torch.inference_mode():
-                x0_src_denorm = pipe.vae.encode(image_src).latent_dist.mode()
-            
-            x0_src = (x0_src_denorm - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-            x0_src = x0_src.to(device)
-            
-            # ================= SIDD 路径处理核心逻辑 =================
-            # SIDD 的图片名都是 NOISY_SRGB_010.PNG，如果不处理会覆盖
-            # 这里的逻辑是：如果路径包含父文件夹，就把父文件夹名拼上去
+            # 获取 Scene ID
             path_parts = image_src_path.replace("\\", "/").split("/")
-            
             if len(path_parts) >= 2:
-                # 例如: 001_NOISY_SRGB_010
-                src_prompt_txt = f"{path_parts[-2]}_{path_parts[-1].split('.')[0]}"
+                # 例如: 0002_001_S6_..._N
+                scene_id = path_parts[-2]
             else:
-                src_prompt_txt = path_parts[-1].split('.')[0]
-            # =======================================================
+                scene_id = path_parts[-1].split('.')[0]
             
-            for tar_num, tar_prompt in enumerate(tar_prompts):
+            print(f"🖼️ Processing Tiled SD3: {scene_id} ...")
+            
+            # 调用 Tiling 函数
+            final_image = tiled_inference_sd3(
+                pipe, scheduler, image_src_path, 
+                prompt_config, run_args, device
+            )
+            
+            # 保存
+            # 结构: outputs/实验名/SD3_Tiled/SceneID/参数.png
+            save_dir = f"outputs/{exp_name}/SD3_Tiled/{scene_id}"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            filename = f"nmin{run_args['n_min']}_src{run_args['src_cfg']}_tar{run_args['tar_cfg']}.png"
+            save_path = f"{save_dir}/{filename}"
+            
+            final_image.save(save_path)
+            print(f"✅ Saved: {save_path}")
 
-                # 确定目标文件夹名称
-                if tar_num < len(target_codes):
-                    tar_prompt_txt = target_codes[tar_num]
-                else:
-                    tar_prompt_txt = str(tar_num)
-
-                print(f"Processing: {src_prompt_txt} -> {tar_prompt_txt}")
-
-                # 调用 FlowEditSD3 (已移除 coupling_strength)
-                x0_tar = FlowEditSD3(
-                    pipe,
-                    scheduler,
-                    x0_src,
-                    src_prompt,
-                    tar_prompt,
-                    negative_prompt,
-                    T_steps=T_steps,
-                    n_avg=n_avg,
-                    src_guidance_scale=src_guidance_scale,
-                    tar_guidance_scale=tar_guidance_scale,
-                    n_min=n_min,
-                    n_max=n_max
-                    # 注意：这里不再传递 coupling_strength
-                )
-
-                # Decode
-                x0_tar_denorm = (x0_tar / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
-                with torch.autocast("cuda"), torch.inference_mode():
-                    image_tar = pipe.vae.decode(x0_tar_denorm, return_dict=False)[0]
-                
-                image_tar = pipe.image_processor.postprocess(image_tar)
-                
-                # 构造保存路径
-                # 结构: outputs/实验名/SD3/src_场景ID/tar_code/文件名.png
-                save_dir = f"outputs/{exp_name}/{model_type}/src_{src_prompt_txt}/tar_{tar_prompt_txt}"
-                os.makedirs(save_dir, exist_ok=True)
-                
-                output_filename = f"n_min_{n_min}_n_max_{n_max}_src{src_guidance_scale}_tar{tar_guidance_scale}_T_steps_{T_steps}.png"
-                save_path = f"{save_dir}/{output_filename}"
-                
-                image_tar[0].save(save_path)
-                print(f"   Saved to: {save_path}")
-
-    print("Done")
+    print("Done! All 'N' images processed.")
