@@ -52,7 +52,6 @@ def main():
     if args.model_type == "FLUX":
         model_id = "black-forest-labs/FLUX.1-dev"
         pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
-        # FLUX 推荐 Tolerance
         # if args.tolerance == 0: args.tolerance = 1e-3
         
     elif args.model_type == "SD3":
@@ -64,11 +63,10 @@ def main():
             text_encoder_3=None, 
             tokenizer_3=None
         ).to(device)
-        # SD3 推荐 Tolerance
         # if args.tolerance == 0: args.tolerance = 1e-4
 
     # --- 2. 遍历噪声等级 ---
-    sigmas = [10]
+    sigmas = [25,50]
     
     for sigma in sigmas:
         curr_input_dir = os.path.join(args.input_dir, f"sigma_{sigma}")
@@ -84,19 +82,18 @@ def main():
         # --- 3. 动态配置参数 ---
         if sigma <= 15:
             deg_scale = 2.0 if args.model_type == "FLUX" else 4.0
-            # clean_scale = 2.0 if args.model_type == "FLUX" else 4.0
+            clean_scale = 2.0 if args.model_type == "FLUX" else 4.0
         elif sigma <= 30:
             deg_scale = 3.0 if args.model_type == "FLUX" else 5.0
-            # clean_scale = 3.0 if args.model_type == "FLUX" else 5.0
+            clean_scale = 3.0 if args.model_type == "FLUX" else 5.0
         else:
             deg_scale = 4.0 if args.model_type == "FLUX" else 6.0
-            # clean_scale = 4.0 if args.model_type == "FLUX" else 6.0
+            clean_scale = 4.0 if args.model_type == "FLUX" else 6.0
         # deg_scale = 2.5
-        clean_scale = 1.5 if args.model_type == "FLUX" else 1.0
+        # clean_scale = 1.5 if args.model_type == "FLUX" else 1.0
         deg_prompt = "An image added with Gaussian noise"
         clean_prompt = "A denoised image"
         
-        # 获取图片列表
         image_files = [f for f in os.listdir(curr_input_dir) if f.endswith(('.png', '.jpg'))]
         
         for img_name in tqdm(image_files, desc=f"Sigma {sigma}"):

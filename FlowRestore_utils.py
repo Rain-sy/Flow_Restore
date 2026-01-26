@@ -35,9 +35,9 @@ def calculate_shift(
     mu = image_seq_len * m + b
     return mu
 
-def degradation_fn(z0_hat, target_size=None):
+def default_degradation_fn(z0_hat, target_size=None):
     """
-    Downsampling operator for regularization.
+    Default Downsampling operator.
     Uses Area interpolation for better gradient stability.
     """
     if target_size is None:
@@ -51,26 +51,14 @@ def unpack_latents_flux_manual(latents, height, width, vae_scale_factor):
     """
     batch_size, seq_len, channels_packed = latents.shape
     
-    # 计算 Latent 的实际尺寸 (H, W)
     h_lat = height // vae_scale_factor
     w_lat = width // vae_scale_factor
-    
-    # FLUX Pack 操作会将 2x2 的像素块折叠进通道
-    # 所以 Grid 的尺寸是 Latent 尺寸的一半
     h_grid = h_lat // 2
     w_grid = w_lat // 2
-    
-    # 检查通道数 (通常是 16 * 4 = 64)
     channels = channels_packed // 4
     
-    # 1. View 还原为 Grid [B, H/2, W/2, C, 2, 2]
-    # 这里我们显式使用 h_grid, w_grid，保证 size 匹配
     latents = latents.view(batch_size, h_grid, w_grid, channels, 2, 2)
-    
-    # 2. Permute 调整维度顺序 [B, C, H/2, 2, W/2, 2]
     latents = latents.permute(0, 3, 1, 4, 2, 5)
-    
-    # 3. Reshape 合并空间维度 [B, C, H, W]
     latents = latents.reshape(batch_size, channels, h_lat, w_lat)
     
     return latents
@@ -121,7 +109,7 @@ def calc_v_flux(pipe, latents, prompt_embeds, pooled_prompt_embeds, guidance, te
 # Main Restoration Functions
 # =========================================================================
 
-@torch.no_grad()
+# @torch.no_grad()
 def FlowRestoreSD3(
     pipe,
     scheduler,
@@ -135,7 +123,7 @@ def FlowRestoreSD3(
     clean_guidance_scale: float = 2.5,       
     n_min: int = 0,
     n_max: int = 24,
-    reg_scale: float = 200,  
+    reg_scale: float = 0.0,  
     degradation_fn = None,      
     adaptive_tolerance: float = 0.0001, 
     min_inference_steps: int = 15
@@ -167,7 +155,8 @@ def FlowRestoreSD3(
     pipe._guidance_scale = 1.5 
     
     zt_edit = x_lq.clone()
-    target_size = (x_lq.shape[2], x_lq.shape[3]) 
+    # 原始 Latent 的高宽
+    original_size = (x_lq.shape[2], x_lq.shape[3]) 
     prev_z0_hat = None
 
     iterator = tqdm(enumerate(timesteps), total=len(timesteps), desc="FlowRestoring SD3")
@@ -187,6 +176,7 @@ def FlowRestoreSD3(
             V_delta_avg = torch.zeros_like(x_lq)
             zt_edit_grad = zt_edit.detach().requires_grad_(True)
             
+            # --- Average Guidance Calculation ---
             for k in range(n_avg):
                 fwd_noise = torch.randn_like(x_lq).to(device)
                 zt_src = (1 - t_i) * x_lq + t_i * fwd_noise
@@ -202,25 +192,51 @@ def FlowRestoreSD3(
                 
                 V_delta_avg += (1/n_avg) * (Vt_clean - Vt_deg)
 
+            # --- z0 estimation for Regularization ---
             z0_hat = zt_edit_grad - t_i * V_delta_avg
             
+            # Adaptive Stopping Logic
             if adaptive_tolerance > 0 and i >= min_inference_steps:
                 if prev_z0_hat is not None:
                     diff = torch.mean((z0_hat.detach().float() - prev_z0_hat.float()) ** 2).item()
-                    iterator.set_postfix({"Diff": f"{diff:.2e}"})
+                    iterator.set_postfix({"Diff": f"{diff:.6e}"})
                     if diff < adaptive_tolerance:
                         print(f"\n[Adaptive Stop] Converged at step {i}/{T_steps}")
                         return z0_hat.detach()
                 prev_z0_hat = z0_hat.detach().clone()
             
+            # --- Regularization Gradient ---
             reg_grad = torch.zeros_like(zt_edit)
             if reg_scale > 0:
+                # 1. 对预测结果应用退化函数
                 if degradation_fn is None:
                     z0_degraded = z0_hat
                 else:
-                    z0_degraded = degradation_fn(z0_hat, target_size)
+                    # 尝试调用，优先支持不带 target_size 的调用（闭包）
+                    try:
+                        z0_degraded = degradation_fn(z0_hat)
+                    except TypeError:
+                        # 兼容旧接口
+                        z0_degraded = degradation_fn(z0_hat, original_size)
                 
-                loss_reg = F.mse_loss(z0_degraded, x_lq.detach())
+                # 2. 准备 Loss Target (Smart Consistency Check)
+                # 如果 z0_degraded 尺寸变小了 (SR任务)，则也必须将参考图 x_lq 下采样，
+                # 确保比较的是 Low-Res vs Low-Res
+                if z0_degraded.shape != x_lq.shape:
+                    with torch.no_grad():
+                        if degradation_fn is None:
+                            # 理论上不该进这里，但作为 fallback
+                            target_degraded = F.interpolate(x_lq.detach(), size=z0_degraded.shape[2:], mode='area')
+                        else:
+                            try:
+                                target_degraded = degradation_fn(x_lq.detach())
+                            except TypeError:
+                                target_degraded = degradation_fn(x_lq.detach(), original_size)
+                else:
+                    target_degraded = x_lq.detach()
+                
+                # 3. Calculate Loss & Grad
+                loss_reg = F.mse_loss(z0_degraded, target_degraded)
                 reg_grad = torch.autograd.grad(loss_reg, zt_edit_grad)[0]
 
             zt_edit = zt_edit.detach()
@@ -233,19 +249,19 @@ def FlowRestoreSD3(
     return zt_edit
 
 
-@torch.no_grad()
+# @torch.no_grad()
 def FlowRestoreFLUX(
     pipe,
     scheduler,
     x_lq,                      # Input Latent [B, C, H, W]
     degradation_prompt,
     clean_prompt="",
-    T_steps: int = 28,
-    n_avg: int = 1,  #must > 0?
-    degradation_guidance_scale: float = 2.0,
-    clean_guidance_scale: float = 2.0,
-    n_min: int = 0,
-    n_max: int = 22,
+    T_steps: int = 30,
+    n_avg: int = 1,
+    degradation_guidance_scale: float = 3.5,
+    clean_guidance_scale: float = 5.5,
+    n_min: int = 3,
+    n_max: int = 24,
     reg_scale: float = 0.0,
     degradation_fn = None,
     adaptive_tolerance: float = 0.0,
@@ -256,7 +272,6 @@ def FlowRestoreFLUX(
     
     # 1. Pack Latents
     num_channels_latents = x_lq.shape[1]
-    # pipe._pack_latents 应该是稳定的，因为它只需要 latent 的 H/W
     x_lq_packed = pipe._pack_latents(x_lq, x_lq.shape[0], num_channels_latents, x_lq.shape[2], x_lq.shape[3])
     
     # 2. Prepare Timesteps
@@ -319,7 +334,7 @@ def FlowRestoreFLUX(
             for k in range(n_avg):
                 fwd_noise = torch.randn_like(x_lq_packed).to(device)
                 zt_src = (1 - t_i) * x_lq_packed + t_i * fwd_noise
-                zt_tar = zt_edit_grad + (zt_src - x_lq_packed)
+                zt_tar = zt_edit_grad
                 
                 Vt_deg = calc_v_flux(
                     pipe, zt_src, deg_prompt_embeds, deg_pooled_prompt_embeds, 
@@ -335,13 +350,13 @@ def FlowRestoreFLUX(
             # --- Regularization & Stop Check ---
             z0_hat_packed = zt_edit_grad - t_i * V_delta_avg
             
+            # Adaptive Stop
             if adaptive_tolerance > 0 and i >= min_inference_steps:
                 if prev_z0_hat is not None:
                     diff = torch.mean((z0_hat_packed.detach() - prev_z0_hat) ** 2).item()
-                    iterator.set_postfix({"Diff": f"{diff:.2e}"})
+                    iterator.set_postfix({"Diff": f"{diff:.6e}"})
                     if diff < adaptive_tolerance:
                         print(f"\n[Adaptive Stop] Converged at step {i}/{T_steps}")
-                        # 使用手动 Unpack
                         return unpack_latents_flux_manual(
                             z0_hat_packed.detach(), 
                             x_lq.shape[2] * pipe.vae_scale_factor, 
@@ -350,10 +365,10 @@ def FlowRestoreFLUX(
                         )
                 prev_z0_hat = z0_hat_packed.detach().clone()
 
-            # Regularization
+            # --- Regularization ---
             reg_grad = torch.zeros_like(zt_edit)
             if reg_scale > 0:
-                # 使用手动 Unpack
+                # 为了做 Spatial Degradation，必须先 Unpack 回 [B,C,H,W]
                 z0_hat_spatial = unpack_latents_flux_manual(
                     z0_hat_packed, 
                     x_lq.shape[2] * pipe.vae_scale_factor, 
@@ -361,12 +376,35 @@ def FlowRestoreFLUX(
                     pipe.vae_scale_factor
                 )
                 
+                # 1. 应用退化函数
                 if degradation_fn is None:
                     z0_degraded = z0_hat_spatial
                 else:
-                    z0_degraded = degradation_fn(z0_hat_spatial)
+                    try:
+                        z0_degraded = degradation_fn(z0_hat_spatial)
+                    except TypeError:
+                        z0_degraded = degradation_fn(z0_hat_spatial, (z0_hat_spatial.shape[2], z0_hat_spatial.shape[3]))
                 
-                loss_reg = F.mse_loss(z0_degraded, x_lq.detach())
+                # 2. 准备 Loss Target (Smart Consistency Check for FLUX)
+                # 注意：x_lq 是 Spatial [B,C,H,W], zt_edit_grad 是 Packed
+                # 比较必须在 Spatial 维度或 Degraded Spatial 维度进行
+                
+                if z0_degraded.shape != x_lq.shape:
+                    # SR Case: Downsample the reference (x_lq) to match
+                    with torch.no_grad():
+                        if degradation_fn is None:
+                            target_degraded = F.interpolate(x_lq.detach(), size=z0_degraded.shape[2:], mode='area')
+                        else:
+                            try:
+                                target_degraded = degradation_fn(x_lq.detach())
+                            except TypeError:
+                                target_degraded = degradation_fn(x_lq.detach(), (x_lq.shape[2], x_lq.shape[3]))
+                else:
+                    target_degraded = x_lq.detach()
+
+                loss_reg = F.mse_loss(z0_degraded, target_degraded)
+                
+                # 求导，并链式法则回传到 packed latent (自动微分处理)
                 reg_grad = torch.autograd.grad(loss_reg, zt_edit_grad)[0]
 
             zt_edit = zt_edit.detach()
@@ -380,7 +418,6 @@ def FlowRestoreFLUX(
             )
             zt_edit = zt_edit + dt * Vt_clean
 
-    # Final Unpack 使用手动函数
     x_out_spatial = unpack_latents_flux_manual(
         zt_edit, 
         x_lq.shape[2] * pipe.vae_scale_factor, 

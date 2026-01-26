@@ -56,7 +56,7 @@ def main():
     clean_guidance_scale = 3.5       
     
     tolerance = 1e-5             # 自适应停止阈值 (SD3 轨迹比 FLUX 稍弯曲一点，1e-5 比较安全)
-    min_steps = 35               # 最小步数
+    min_steps = 28               # 最小步数
     # ===========================================
 
     print(f"Loading SD3 model on {device}...")
