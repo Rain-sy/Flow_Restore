@@ -1,6 +1,0 @@
-Source prompt: A large brown bear walking Wthrough a grassy field.
-
-Target prompt: A large brown bear walking through a grassy field.
-
-Seed: 42
-Sampler type: SD3

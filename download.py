@@ -3,13 +3,13 @@ import shutil
 import os
 # 1. 先下载到默认缓存位置
 print("正在下载...")
-cache_path = kagglehub.dataset_download("drxinchengzhu/kodak24")
+cache_path = kagglehub.dataset_download("takihasan/div2k-dataset-for-super-resolution")
 print("下载完成，缓存路径:", cache_path)
 
 # 2. 指定你的目标路径
 # 注意：'/Data' 指的是根目录下的 Data 文件夹。
 # 如果你是想下载到当前脚本所在目录下的 Data 文件夹，请改为 './Data'
-target_dir = "./Data" 
+target_dir = "meanflow/Data" 
 
 # 3. 将文件移动到目标路径
 print(f"正在移动文件到 {target_dir} ...")
